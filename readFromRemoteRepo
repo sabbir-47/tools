@@ -1,0 +1,345 @@
+package main
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"net/http"
+	"os"
+	"reflect"
+	"strings"
+	"text/tabwriter"
+	"time"
+
+	"github.com/fatih/color"
+	yaml "gopkg.in/yaml.v3"
+	"sigs.k8s.io/kustomize/pkg/git"
+)
+
+var (
+	//github url
+	gitHubRepo = "github"
+	github     = "https://github.com/openshift-kni/cnf-features-deploy/ztp/source-crs?ref=release-4.13"
+
+	//gitlab url
+	gitLabRepo    = "gitlab"
+	gitlab_master = "https://gitlab.cee.redhat.com/sahasan/source-cr-project/source-crs?ref=main"
+	gitlab_branch = "https://gitlab.cee.redhat.com/sahasan/source-cr-project/source-crs?ref=version_4.14"
+
+	//local url running in nginx container
+	localRepo       = "http://localhost:8888/content/source-crs"
+	remoteLocalPath = "./sourceCR"
+
+	// github: storageNS; gitlab: SriovSubscription
+	filename  = []string{"MachineConfigAcceleratedStartup.yaml", "test2.yaml", "test.yaml", "StorageNS.yaml", "sabbir.yaml", "SriovSubscription_gitlab.yaml", "ClusterLogCatSource.yaml"}
+	url_paths = []string{github, localRepo, remoteLocalPath, gitlab_branch}
+	rawURL    = "https://raw.githubusercontent.com"
+)
+
+const httpScheme = "http://"
+const httpsScheme = "https://"
+const prefix = "./"
+
+func splitYamls(yamls []byte) ([][]byte, error) {
+	decoder := yaml.NewDecoder(bytes.NewReader(yamls))
+	var resources [][]byte
+
+	for {
+		var resIntf interface{}
+		err := decoder.Decode(&resIntf)
+
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		// Check that resIntf is not nil in order to mitigate appending an empty
+		// object as a result of redundant trailing seperator(s) "---""
+		if resIntf != nil {
+			resBytes, err := yaml.Marshal(resIntf)
+
+			if err != nil {
+				return nil, err
+			}
+
+			resources = append(resources, resBytes)
+		}
+	}
+	return resources, nil
+}
+
+func transformURL(url, fileName string) (string, error) {
+
+	var newURL string
+	testString, err := git.NewRepoSpecFromUrl(url)
+	if err != nil {
+		fmt.Println(err)
+		return newURL, err
+	}
+	//	fmt.Printf("hostname:  %+v\n", testString)
+	hostname := reflect.ValueOf(testString).Elem().FieldByName("host")
+	repoName := reflect.ValueOf(testString).Elem().FieldByName("orgRepo")
+	branch := reflect.ValueOf(testString).Elem().FieldByName("ref")
+	repoPath := reflect.ValueOf(testString).Elem().FieldByName("path")
+
+	//	test := hostname.String()
+
+	switch {
+	case strings.Contains(hostname.String(), gitHubRepo):
+		newURL = rawURL + "/" + repoName.String() + "/" + branch.String() + "/" + repoPath.String() + "/" + fileName
+		/*
+			fmt.Printf("newURL:  %s\n", newURL)
+			fmt.Printf("hostname:  %s\n", hostname)
+			fmt.Printf("repopath %s\n", repoName)
+			fmt.Printf("branch %s\n", branch)
+			fmt.Printf("ref %s\n", branch)
+		*/
+	case strings.Contains(hostname.String(), gitLabRepo):
+		newURL = hostname.String() + repoName.String() + "/-/raw/" + branch.String() + "/" + repoPath.String() + "/" + fileName
+
+	default:
+		newURL = url + "/" + fileName
+
+	}
+
+	return newURL, nil
+}
+
+func readContent(link string) ([]byte, error) {
+
+	var content []byte
+	resp, err := http.Get(link)
+	if err != nil {
+		fmt.Printf("http error ** %s **\n", err)
+		return content, err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return content, fmt.Errorf("URL : '%s' not found\n", link)
+	}
+
+	defer resp.Body.Close()
+
+	content, err = ioutil.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Printf("Reading error from URL: ** %s **\n", err)
+		return content, err
+	}
+
+	return content, nil
+}
+
+type Status struct {
+	Url      string
+	fileName []string
+}
+
+func updateDatabase(p string, file string, st []Status) []Status {
+
+	if len(st) == 0 {
+		for _, v := range url_paths {
+			st = append(st, Status{
+				Url:      v,
+				fileName: []string{},
+			})
+		}
+	}
+
+	for i, v := range st {
+		if v.Url == p {
+			v.fileName = append(v.fileName, file)
+			st[i].fileName = v.fileName
+		}
+	}
+
+	return st
+}
+
+/*
+func printMessage(p *[]string) (string, bool) {
+	fmt.Printf("****** address **** value: %v\n", p)
+
+	if p == nil {
+		return fmt.Sprintf("address is not set"), false
+	}
+
+	return fmt.Sprintf("address is set"), true
+}
+*/
+type NFound struct {
+	found    bool
+	fileName []string
+}
+
+func updateFileStatus(file string, t bool, fStatus []NFound) []NFound {
+	//	fmt.Printf("%%--%% Received file:%s and found: %v, current struct value %v %%--%%\n", file, t, fStatus)
+	if len(fStatus) == 0 {
+		fStatus = append(fStatus, NFound{
+			found:    true,
+			fileName: []string{},
+		}, NFound{
+			found:    false,
+			fileName: []string{},
+		})
+	}
+
+	// test =  NFound{found: true, fileName: []string{},found: true, fileName: []string{}}
+	for i, v := range fStatus {
+		if v.found == t {
+			v.fileName = append(v.fileName, file)
+			fStatus[i].fileName = v.fileName
+		}
+	}
+	//	fmt.Printf("%%--%% value of updated struct : %v %%--%%\n", fStatus)
+	return fStatus
+
+}
+
+func WriteFile(s string) {
+
+	fileWrite, err := os.OpenFile("output.txt", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	_, err = fmt.Fprintln(fileWrite, s)
+	if err != nil {
+		fmt.Println(err)
+		fileWrite.Close()
+		return
+	}
+	err = fileWrite.Close()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func main() {
+
+	// loop through filename, and inside loop through the destination path/link
+
+	//	var statusList []Status
+	var updated []Status
+	var fStatus []NFound
+	//	fmt.Printf("fileStaus value in the beginning %v", fStatus)
+
+	startTime := time.Now()
+
+	for _, f := range filename {
+
+	Loop:
+		for i, p := range url_paths {
+			//	if strings.Contains(p, httpScheme) || strings.Contains(p, httpsScheme) {
+
+			switch {
+			case strings.Contains(p, httpScheme) || strings.Contains(p, httpsScheme):
+				// compute final URL
+				finalUrl, err := transformURL(p, f)
+				if err != nil {
+					fmt.Println(err)
+				}
+				// read Content
+
+				fileByte, err := readContent(finalUrl)
+				if err == nil {
+					fmt.Printf("file %s found in URL %s\n", f, p)
+					updated = updateDatabase(p, f, updated)
+					fStatus = updateFileStatus(f, true, fStatus)
+					_ = fileByte
+					color.Cyan("%s read from link %s\n", f, p)
+					WriteFile(fmt.Sprintf("- %s read from link %s", f, p))
+					break Loop
+
+				} else if err != nil && i == (len(url_paths)-1) {
+					fStatus = updateFileStatus(f, false, fStatus)
+					fmt.Printf("%s was not found in any URL\n", f)
+					WriteFile(fmt.Sprintf("- %s was not found in any URL", f))
+					color.Red("%s was tried to read from link %s\n", f, p)
+				}
+
+			case strings.HasPrefix(p, prefix):
+				//	fmt.Printf("path: %s is not a remote url\n", p)
+				currentDir, err := os.Getwd()
+				if err != nil {
+					fmt.Printf("err is: %s\n", err)
+				}
+				path := currentDir + "/" + p + "/" + f
+
+				fileByte, err := os.ReadFile(path)
+				if err == nil {
+					updated = updateDatabase(p, f, updated)
+					fStatus = updateFileStatus(f, true, fStatus)
+					_ = fileByte
+					fmt.Println(string(fileByte))
+					color.Cyan("%s read from path %s\n", f, p)
+					WriteFile(fmt.Sprintf("- %s read from link %s", f, p))
+					break Loop
+				}
+				if errors.Is(err, os.ErrNotExist) && i == (len(url_paths)-1) {
+					fStatus = updateFileStatus(f, false, fStatus)
+					fmt.Printf("%s was not found in path\n", p)
+					WriteFile(fmt.Sprintf("- %s was not found in path", p))
+					color.Red("%s was tried to read from link %s\n", f, p)
+
+				} else {
+					fmt.Printf("last error is %v\n", err)
+					color.Red("%s was tried to read from link %s\n", f, p)
+				}
+
+			}
+
+		}
+	}
+
+	elapsedTime := time.Since(startTime)
+	fmt.Printf("Time execution: %v\n", elapsedTime)
+	//	printMessage(fStatus, updated)
+
+}
+
+func printMessage(fStatus []NFound, updated []Status) {
+	fmt.Println("\n")
+
+	fmt.Printf("** File status struct** %v\n", fStatus)
+
+	fmt.Println("\n")
+
+	fmt.Println(strings.Repeat("*", 25))
+	color.Cyan("Reading all files are done")
+	fmt.Println(strings.Repeat("*", 25))
+
+	fileWrite, err := os.OpenFile("output.txt", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	fmt.Println(strings.Repeat("-", 143))
+	//	w := tabwriter.NewWriter(os.Stdout, 10, 0, 0, ' ', tabwriter.Debug)
+	w := tabwriter.NewWriter(fileWrite, 10, 0, 0, ' ', tabwriter.Debug)
+	fmt.Fprintln(w, "Order\t Url Link\t File Name\t")
+	for i, v := range updated {
+		fmt.Fprintln(w, i, "\t", v.Url, "\t", v.fileName, "\t")
+	}
+
+	w.Flush()
+	fmt.Println(strings.Repeat("-", 143))
+
+	fmt.Println("\n")
+	fmt.Println(strings.Repeat("-", 140))
+	//	w = tabwriter.NewWriter(os.Stdout, 10, 0, 0, ' ', tabwriter.Debug)
+	w = tabwriter.NewWriter(fileWrite, 10, 0, 0, ' ', tabwriter.Debug)
+	fmt.Fprintln(w, "File Status\t File Name\t")
+	for _, v := range fStatus {
+		fmt.Fprintln(w, v.found, "\t", v.fileName, "\t")
+	}
+
+	w.Flush()
+	fmt.Println(strings.Repeat("-", 140))
+	fmt.Println("\n")
+}
