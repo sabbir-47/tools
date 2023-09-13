@@ -1,0 +1,7 @@
+{{ if .MaxCPU }}
+{{- "[sysfs]" -}}
+{{range (cpuList .CPU)}}
+/sys/devices/system/cpu/cpufreq/policy[{{.}}]/scaling_max_freq={{$.MaxCPU}}
+/sys/devices/system/cpu/cpufreq/policy[{{.}}]/scaling_min_freq={{$.MinCPU}}
+{{- end }}
+{{ end }}
